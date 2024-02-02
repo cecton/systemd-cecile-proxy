@@ -7,15 +7,15 @@ fn log(priority: &'static str, message: impl AsRef<str>) {
             const_iovec::from_str(priority),
             const_iovec::from_str(message.as_ref()),
         ];
-        ffi::sd_journal_sendv(array.as_ptr(), array.len() as _);
+        assert!(ffi::sd_journal_sendv(array.as_ptr(), array.len() as _) >= 0);
     }
 }
 
 macro_rules! generate_log_function {
     ($($name:ident => $priority:literal,)*) => {
         $(
-            pub fn $name(message: impl AsRef<str>) {
-                log(concat!("PRIORITY=", $priority), message)
+            pub fn $name(message: impl std::fmt::Display) {
+                log(concat!("PRIORITY=", $priority), format!("MESSAGE={message}"))
             }
         )*
     }

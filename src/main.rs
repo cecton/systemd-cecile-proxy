@@ -259,7 +259,7 @@ fn main() -> Result<std::process::ExitCode> {
                                         let buffer = &mut clients[i].buffer_out;
 
                                         if let Some((buffer, _src)) = buffer.take_slice() {
-                                            socket.send_to(buffer, addr_out).unwrap();
+                                            let _ = socket.send_to(buffer, addr_out);
                                         }
                                     })
                                     .end()

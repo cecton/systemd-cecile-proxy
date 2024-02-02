@@ -13,10 +13,10 @@ use std::pin::*;
 fn main() -> Result<std::process::ExitCode> {
     let args: Args = clap::Parser::parse();
 
+    log_info!("Starting up...");
+
     let mut event = Event::default();
     let mut pinned = event.pinned();
-
-    log_info!("Starting up...");
 
     pinned.as_mut().add_signal_default(Signal::TERM);
     pinned.as_mut().add_signal(Signal::INT, |source, _| {
@@ -296,6 +296,8 @@ fn main() -> Result<std::process::ExitCode> {
             }
         }
     }
+
+    notify_ready();
 
     let res = pinned.as_mut().run();
 

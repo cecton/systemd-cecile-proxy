@@ -1,4 +1,5 @@
 use libsystemd_sys::daemon as ffi;
+use std::ffi::*;
 use std::os::fd::*;
 
 const SD_LISTEN_FDS_START: RawFd = 3;
@@ -43,4 +44,40 @@ impl AsRawFd for ListenObject {
             ListenObject::TcpListener(socket) => socket.as_raw_fd(),
         }
     }
+}
+
+pub fn notify(unset_environment: bool, state: impl AsRef<str>) -> Result<(), NulError> {
+    unsafe {
+        let s = CString::new(state.as_ref())?;
+        assert!(
+            ffi::sd_notify(if unset_environment { 1 } else { 0 }, s.as_ptr()) >= 0,
+            "failed to notify"
+        );
+        Ok(())
+    }
+}
+
+#[inline]
+pub fn notify_ready() {
+    let _ = notify(false, "READY=1");
+}
+
+#[inline]
+pub fn notify_reloading() {
+    let _ = notify(false, "RELOADING=1");
+}
+
+#[inline]
+pub fn notify_stopping() {
+    let _ = notify(false, "STOPPING=1");
+}
+
+#[inline]
+pub fn notify_monotonic_usec(usec: u64) {
+    let _ = notify(false, format!("MONOTONIC_USEC={usec}"));
+}
+
+#[inline]
+pub fn notify_status(status: impl std::fmt::Display) {
+    let _ = notify(false, format!("STATUS={}", status));
 }

@@ -51,6 +51,7 @@ fn main() -> Result<std::process::ExitCode> {
                 Usec::Absolute(0)
             },
         );
+        pinned.as_mut().enable(id);
         ActivityMonitor { id, usec }
     });
 

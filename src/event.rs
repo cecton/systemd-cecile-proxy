@@ -163,7 +163,6 @@ impl Event {
 
             assert!(!source.event_source.is_null());
 
-            source.enable();
             source.id()
         }
     }
@@ -351,6 +350,12 @@ impl Event {
             .find(|x| x.id() == id)
             .map(Pin::new)
     }
+
+    pub fn enable(&mut self, id: EventSourceId) {
+        if let Some(source) = self.event_sources.iter().find(|x| x.id() == id) {
+            source.enable();
+        }
+    }
 }
 
 pub enum Usec {
@@ -393,6 +398,16 @@ impl EventSource {
             EventSource::Time(EventSourceTime { event_source, .. }) => *event_source,
             EventSource::Io(EventSourceIo { event_source, .. }) => *event_source,
             EventSource::Signal(EventSourceSignal { event_source, .. }) => *event_source,
+        }
+    }
+
+    fn id(&self) -> EventSourceId {
+        unsafe { EventSourceId::new_unchecked(self.event_source() as _) }
+    }
+
+    fn enable(&self) {
+        unsafe {
+            ffi::sd_event_source_set_enabled(self.event_source(), ffi::SD_EVENT_ON);
         }
     }
 

@@ -601,6 +601,10 @@ impl EventSourceIo {
         let existing_events = self.get_events();
         self.set_events(existing_events ^ events);
     }
+
+    pub fn raw_fd<'a>(&'a mut self) -> BorrowedFd<'a> {
+        unsafe { BorrowedFd::borrow_raw(ffi::sd_event_source_get_io_fd(self.event_source)) }
+    }
 }
 
 pub struct EventSourceSignal {

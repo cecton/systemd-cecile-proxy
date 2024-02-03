@@ -289,6 +289,9 @@ fn main() -> Result<std::process::ExitCode> {
                     .collect::<Result<Vec<_>, _>>()?;
             }
             ListenObject::TcpListener(socket_in) => {
+                use pipe::Pipe;
+                use std::io::Read;
+
                 log_info!(
                     " * TCP: {} <-> {}",
                     socket_in.local_addr().unwrap(),
@@ -297,18 +300,68 @@ fn main() -> Result<std::process::ExitCode> {
                 let addr_out: net::SocketAddr = addr_out.parse()?;
                 let mut buffer = [0; 65507];
 
+                struct Client {
+                    source_in: EventSourceId,
+                    source_out: EventSourceId,
+                    pipe: Pipe,
+                    closed: bool,
+                }
+
+                struct State {
+                    clients: Vec<Client>,
+                }
+
+                fn new_client(
+                    clients: &mut Vec<Client>,
+                    connections_max: usize,
+                    new_client: impl FnOnce() -> Client,
+                ) -> Option<&mut Client> {
+                    let mut slot = None;
+
+                    for (i, client) in clients.iter().enumerate() {
+                        if client.closed {
+                            slot = Some(i);
+                            break;
+                        }
+                    }
+
+                    if slot.is_none() && clients.len() < connections_max {
+                        let pipe = match Pipe::new() {
+                            Ok(pipe) => pipe,
+                            Err(err) => {
+                                log_err!("Could not create new pipe: {err}");
+                                return None;
+                            }
+                        };
+                        clients.push((new_client)());
+                        slot.replace(clients.len() - 1);
+                    }
+
+                    slot.map(|i| &mut clients[i])
+                }
+
                 pinned.as_mut().add_io(
                     socket_in,
                     Events::EPOLLIN,
-                    move |_source, socket_in, events| {
-                        assert!(events & Events::EPOLLIN == Events::EPOLLIN);
+                    move |_source, socket, mut events| {
+                        events
+                            .handle(Events::EPOLLIN, || {
+                                use std::os::fd::AsRawFd;
+                                dbg!(socket.as_raw_fd());
 
-                        let (mut stream, src) = socket_in.accept().unwrap();
+                                let (mut stream, src) = socket.accept().unwrap();
+                                dbg!(stream.as_raw_fd());
 
-                        use std::io::Read;
-                        let n = stream.read(&mut buffer).unwrap();
-                        let s = String::from_utf8_lossy(&buffer[..n]);
-                        dbg!(src, s);
+                                let n = stream.read(&mut buffer).unwrap();
+                                let s = String::from_utf8_lossy(&buffer[..n]);
+                                dbg!(src, s);
+
+                                let socket_out = net::TcpStream::connect(addr_out).unwrap();
+                            })
+                            .handle(Events::EPOLLHUP, || {
+                                dbg!("client hangs up");
+                            })
+                            .end()
                     },
                 );
             }
@@ -341,4 +394,92 @@ struct Args {
     /// Exit when without a connection for this duration (in seconds).
     #[arg(long)]
     exit_idle_time: Option<u64>,
+}
+
+mod pipe {
+    use std::io;
+    use std::os::fd::*;
+    use std::ptr;
+
+    pub struct Pipe {
+        fd_r: OwnedFd,
+        fd_w: OwnedFd,
+        size: usize,
+    }
+
+    impl Pipe {
+        pub fn new() -> io::Result<Self> {
+            unsafe {
+                let mut fds: [libc::c_int; 2] = [0; 2];
+                let res = libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK);
+                if res < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                libc::fcntl(fds[0], libc::F_SETPIPE_SZ, 256 * 1024);
+                let res = libc::fcntl(fds[0], libc::F_GETPIPE_SZ);
+                if res < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let size = res as usize;
+                Ok(Self {
+                    fd_r: OwnedFd::from_raw_fd(fds[0]),
+                    fd_w: OwnedFd::from_raw_fd(fds[1]),
+                    size,
+                })
+            }
+        }
+
+        // NOTE: this code is mostly copied from socket-proxyd.c
+        pub fn shovel(&mut self, from: impl AsRawFd, to: impl AsRawFd, full: &mut usize) {
+            let from = from.as_raw_fd();
+            let to = to.as_raw_fd();
+
+            unsafe {
+                let mut shoveled;
+                loop {
+                    shoveled = false;
+
+                    if *full < self.size {
+                        let res = libc::splice(
+                            from,
+                            ptr::null_mut(),
+                            self.fd_w.as_raw_fd(),
+                            ptr::null_mut(),
+                            self.size - *full,
+                            libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+                        );
+                        assert!(res >= 0, "Failed to splice");
+                        if res > 0 {
+                            *full += res as usize;
+                            shoveled = true;
+                        } else if res == 0 {
+                            // EOF
+                        }
+                    }
+
+                    if *full > 0 {
+                        let res = libc::splice(
+                            self.fd_r.as_raw_fd(),
+                            ptr::null_mut(),
+                            to,
+                            ptr::null_mut(),
+                            *full,
+                            libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+                        );
+                        assert!(res >= 0, "Failed to splice");
+                        if res > 0 {
+                            *full -= res as usize;
+                            shoveled = true;
+                        } else if res == 0 {
+                            // EOF
+                        }
+                    }
+
+                    if !shoveled {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }

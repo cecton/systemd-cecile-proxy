@@ -477,11 +477,12 @@ impl EventSourceTime {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
 pub struct Events(u32);
 
 impl Events {
+    pub const EMPTY: Self = Events(0);
     pub const EPOLLIN: Self = Events(libc::EPOLLIN as _);
     pub const EPOLLOUT: Self = Events(libc::EPOLLOUT as _);
     pub const EPOLLRDHUP: Self = Events(libc::EPOLLRDHUP as _);

@@ -13,17 +13,21 @@ use std::pin::*;
 fn main() -> Result<std::process::ExitCode> {
     let args: Args = clap::Parser::parse();
 
-    log_info!("Starting up...");
+    log_debug!("Starting up...");
 
     let mut event = Event::default();
     let mut pinned = event.pinned();
 
+    // setting up process signal handling for graceful shutdown
     pinned.as_mut().add_signal_default(Signal::TERM);
     pinned.as_mut().add_signal(Signal::INT, |source, _| {
         log_warning!("How dare you interrupt me!");
         source.event().exit(240);
     });
 
+    // setting up ActivityMonitor for monitoring activity and shutting down the service when there
+    // is no more activity (which is then used by systemd PropagatesStopTo= directive to shut down
+    // the server we are proxying to
     struct ActivityMonitor {
         id: EventSourceId,
         usec: u64,
@@ -55,6 +59,9 @@ fn main() -> Result<std::process::ExitCode> {
         ActivityMonitor { id, usec }
     });
 
+    // going through all the sockets received by systemd and all the server addresses received in
+    // arguments and opening proxies for each and every one of them
+    let network_timeout = args.timeout * 1000000;
     for (object, addr_out) in listen_fds(false).into_iter().zip(args.addr_out) {
         match object {
             ListenObject::UdpSocket(socket_in) => {
@@ -64,8 +71,8 @@ fn main() -> Result<std::process::ExitCode> {
                     addr_out
                 );
                 let addr_out: net::SocketAddr = addr_out.parse()?;
-                let timeout = args.timeout * 1000000;
 
+                // a buffer that holds the data, the length of the data and the source origin
                 struct Buffer {
                     buffer: [u8; 65507],
                     n: usize,
@@ -86,6 +93,7 @@ fn main() -> Result<std::process::ExitCode> {
                 }
 
                 impl Buffer {
+                    // take the slice of this buffer and resets its data
                     #[inline]
                     fn take_slice(&mut self) -> Option<(&[u8], net::SocketAddr)> {
                         if self.n > 0 {
@@ -97,6 +105,7 @@ fn main() -> Result<std::process::ExitCode> {
                         }
                     }
 
+                    // get a mutable slice of this buffer only if no data is being hold
                     #[inline]
                     fn get_slice_mut(
                         &mut self,
@@ -108,6 +117,7 @@ fn main() -> Result<std::process::ExitCode> {
                         }
                     }
 
+                    // explicitly reset this buffer, allowing it to be filled again
                     #[inline]
                     fn reset(&mut self) {
                         self.n = 0;
@@ -136,11 +146,15 @@ fn main() -> Result<std::process::ExitCode> {
                     }
                 }
 
+                // a function that finds a valid Client to use for a specific client's IP address
+                //
+                // either the client's IP is already registered, or it will return an empty slot
+                // that can be used
                 fn find_client(
-                    clients: &mut [Client],
+                    clients: &[Client],
                     addr: net::SocketAddr,
                     timeout_threshold: u64,
-                ) -> Option<&mut Client> {
+                ) -> Option<usize> {
                     let mut slot = None;
 
                     for (i, client) in clients.iter().enumerate() {
@@ -160,13 +174,7 @@ fn main() -> Result<std::process::ExitCode> {
                         }
                     }
 
-                    slot.map(|i| {
-                        let old_addr = clients[i].addr.replace(addr);
-                        if old_addr.is_none() || clients[i].last_activity < timeout_threshold {
-                            log_debug!("New client connected ({i}): {addr}");
-                        }
-                        &mut clients[i]
-                    })
+                    slot
                 }
 
                 let socket_in_id = pinned.as_mut().add_io(
@@ -188,11 +196,15 @@ fn main() -> Result<std::process::ExitCode> {
                                 if let Some((buffer, n, src)) = buffer_in.get_slice_mut() {
                                     (*n, *src) = socket.recv_from(buffer).unwrap();
                                     let now = source.event().now(Clock::Monotonic);
-                                    let timeout_threshold = now - timeout;
-                                    let src = *src;
-                                    if let Some(client) =
-                                        find_client(clients, src, timeout_threshold)
-                                    {
+                                    let timeout_threshold = now - network_timeout;
+                                    if let Some(i) = find_client(clients, *src, timeout_threshold) {
+                                        let client = &mut clients[i];
+                                        if client.addr.is_none()
+                                            || client.last_activity < timeout_threshold
+                                        {
+                                            log_debug!("New client connected ({i}): {src}");
+                                        }
+                                        client.addr.replace(*src);
                                         client.last_activity = now;
                                         mem::swap(&mut client.buffer_out, buffer_in);
                                         if let Some(mut source) =
@@ -217,7 +229,7 @@ fn main() -> Result<std::process::ExitCode> {
                                     if let Some(addr) = client.addr {
                                         if let Some((buffer, _src)) = client.buffer_in.take_slice()
                                         {
-                                            socket.send_to(buffer, addr).unwrap();
+                                            let _ = socket.send_to(buffer, addr);
                                         }
                                     }
                                 }
@@ -277,8 +289,14 @@ fn main() -> Result<std::process::ExitCode> {
                     .collect::<Result<Vec<_>, _>>()?;
             }
             ListenObject::TcpListener(socket_in) => {
-                println!("tcp: {} <-> {}", socket_in.local_addr().unwrap(), addr_out);
+                log_info!(
+                    " * TCP: {} <-> {}",
+                    socket_in.local_addr().unwrap(),
+                    addr_out
+                );
+                let addr_out: net::SocketAddr = addr_out.parse()?;
                 let mut buffer = [0; 65507];
+
                 pinned.as_mut().add_io(
                     socket_in,
                     Events::EPOLLIN,
@@ -301,7 +319,7 @@ fn main() -> Result<std::process::ExitCode> {
 
     let res = pinned.as_mut().run();
 
-    log_info!("Exiting...");
+    log_debug!("Event log exited gracefully.");
 
     Ok((res as u8).into())
 }
@@ -312,7 +330,7 @@ struct Args {
     #[clap(id = " HOST:PORT | SOCKET ")]
     addr_out: Vec<String>,
 
-    /// Maximum number of clients.
+    /// Maximum number of clients connected (per socket).
     #[arg(long, short = 'c', default_value = "32")]
     connections_max: usize,
 

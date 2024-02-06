@@ -16,7 +16,7 @@ fn main() -> Result<std::process::ExitCode> {
     log_debug!("Starting up...");
 
     let mut event = Event::default();
-    let mut pinned = event.pinned();
+    let mut pinned = pin!(event);
 
     // setting up process signal handling for graceful shutdown
     pinned.as_mut().add_signal_default(Signal::TERM);
@@ -34,10 +34,10 @@ fn main() -> Result<std::process::ExitCode> {
     }
 
     impl ActivityMonitor {
-        fn ping(&mut self, mut event: Pin<&mut Event>) {
+        fn ping(&mut self, event: Pin<&mut Event>) {
             if let Some(mut source) = event.get_event_source_time(self.id) {
-                let now = source.event().now(Clock::Monotonic);
-                source.set_time(Usec::Absolute(now + self.usec));
+                let now = source.as_mut().event().now(Clock::Monotonic);
+                source.as_mut().set_time(Usec::Absolute(now + self.usec));
             }
         }
     }
@@ -45,7 +45,7 @@ fn main() -> Result<std::process::ExitCode> {
     *pinned.as_mut().userdata() = args.exit_idle_time.map(|seconds| {
         let usec = seconds * 1000000;
         let now = pinned.now(Clock::Monotonic);
-        let id = pinned.as_mut().add_time(
+        let mut source = pinned.as_mut().add_time(
             Clock::Monotonic,
             Usec::Absolute(now + usec),
             0,
@@ -55,8 +55,11 @@ fn main() -> Result<std::process::ExitCode> {
                 Usec::Absolute(0)
             },
         );
-        pinned.as_mut().enable(id);
-        ActivityMonitor { id, usec }
+        source.as_mut().enable();
+        ActivityMonitor {
+            id: source.id(),
+            usec,
+        }
     });
 
     // going through all the sockets received by systemd and all the server addresses received in
@@ -177,106 +180,122 @@ fn main() -> Result<std::process::ExitCode> {
                     slot
                 }
 
-                let socket_in_id = pinned.as_mut().add_io(
-                    socket_in,
-                    Events::EPOLLIN,
-                    move |source, socket, mut events| {
-                        if let Some(activity_monitor) =
-                            source.event().userdata::<Option<ActivityMonitor>>()
-                        {
-                            activity_monitor.ping(source.event());
-                        }
+                let socket_in_id = pinned
+                    .as_mut()
+                    .add_io(
+                        socket_in,
+                        Events::EPOLLIN,
+                        move |mut source, socket, mut events| {
+                            if let Some(activity_monitor) = source
+                                .as_mut()
+                                .event()
+                                .userdata::<Option<ActivityMonitor>>()
+                            {
+                                activity_monitor.ping(source.as_mut().event());
+                            }
 
-                        events
-                            .handle(Events::EPOLLIN, || {
-                                let State {
-                                    clients, buffer_in, ..
-                                } = source.event().userdata::<State>();
+                            events
+                                .handle(Events::EPOLLIN, || {
+                                    let State {
+                                        clients, buffer_in, ..
+                                    } = source.as_mut().event().userdata::<State>();
 
-                                if let Some((buffer, n, src)) = buffer_in.get_slice_mut() {
-                                    (*n, *src) = socket.recv_from(buffer).unwrap();
-                                    let now = source.event().now(Clock::Monotonic);
-                                    let timeout_threshold = now - network_timeout;
-                                    if let Some(i) = find_client(clients, *src, timeout_threshold) {
-                                        let client = &mut clients[i];
-                                        if client.addr.is_none()
-                                            || client.last_activity < timeout_threshold
+                                    if let Some((buffer, n, src)) = buffer_in.get_slice_mut() {
+                                        (*n, *src) = socket.recv_from(buffer).unwrap();
+                                        let now = source.as_mut().event().now(Clock::Monotonic);
+                                        let timeout_threshold = now - network_timeout;
+                                        if let Some(i) =
+                                            find_client(clients, *src, timeout_threshold)
                                         {
-                                            log_debug!("New client connected ({i}): {src}");
+                                            let client = &mut clients[i];
+                                            if client.addr.is_none()
+                                                || client.last_activity < timeout_threshold
+                                            {
+                                                log_debug!("New client connected ({i}): {src}");
+                                            }
+                                            client.addr.replace(*src);
+                                            client.last_activity = now;
+                                            mem::swap(&mut client.buffer_out, buffer_in);
+                                            if let Some(mut source) = source
+                                                .as_mut()
+                                                .event()
+                                                .get_event_source_io(client.id)
+                                            {
+                                                source.as_mut().add_events(Events::EPOLLOUT);
+                                            }
+                                        } else {
+                                            log_warning!("Maximum number of connections reached.");
                                         }
-                                        client.addr.replace(*src);
-                                        client.last_activity = now;
-                                        mem::swap(&mut client.buffer_out, buffer_in);
-                                        if let Some(mut source) =
-                                            source.event().get_event_source_io(client.id)
-                                        {
-                                            source.add_events(Events::EPOLLOUT);
-                                        }
+                                        buffer_in.reset();
                                     } else {
-                                        log_warning!("Maximum number of connections reached.");
+                                        source.as_mut().remove_events(Events::EPOLLIN);
                                     }
-                                    buffer_in.reset();
-                                } else {
-                                    source.remove_events(Events::EPOLLIN);
-                                }
-                            })
-                            .handle(Events::EPOLLOUT, || {
-                                source.remove_events(Events::EPOLLOUT);
+                                })
+                                .handle(Events::EPOLLOUT, || {
+                                    source.as_mut().remove_events(Events::EPOLLOUT);
 
-                                let State { clients, .. } = source.event().userdata::<State>();
+                                    let State { clients, .. } =
+                                        source.as_mut().event().userdata::<State>();
 
-                                for client in clients {
-                                    if let Some(addr) = client.addr {
-                                        if let Some((buffer, _src)) = client.buffer_in.take_slice()
-                                        {
-                                            let _ = socket.send_to(buffer, addr);
+                                    for client in clients {
+                                        if let Some(addr) = client.addr {
+                                            if let Some((buffer, _src)) =
+                                                client.buffer_in.take_slice()
+                                            {
+                                                let _ = socket.send_to(buffer, addr);
+                                            }
                                         }
                                     }
-                                }
-                            })
-                            .end()
-                    },
-                );
+                                })
+                                .end()
+                        },
+                    )
+                    .id();
 
                 pinned.as_mut().userdata::<State>().clients = (0..args.connections_max)
                     .map(|i| -> Result<Client> {
                         let socket = net::UdpSocket::bind((net::Ipv4Addr::UNSPECIFIED, 0))?;
                         socket.connect(addr_out)?;
-                        let id = pinned.as_mut().add_io(
-                            socket,
-                            Events::EPOLLIN,
-                            move |source, socket, mut events| {
-                                events
-                                    .handle(Events::EPOLLIN, || {
-                                        let State { clients, .. } =
-                                            source.event().userdata::<State>();
+                        let id = pinned
+                            .as_mut()
+                            .add_io(
+                                socket,
+                                Events::EPOLLIN,
+                                move |mut source, socket, mut events| {
+                                    events
+                                        .handle(Events::EPOLLIN, || {
+                                            let State { clients, .. } =
+                                                source.as_mut().event().userdata::<State>();
 
-                                        if let Some((buf, n, src)) =
-                                            clients[i].buffer_in.get_slice_mut()
-                                        {
-                                            (*n, *src) = socket.recv_from(buf).unwrap();
-
-                                            if let Some(mut source) =
-                                                source.event().get_event_source_io(socket_in_id)
+                                            if let Some((buf, n, src)) =
+                                                clients[i].buffer_in.get_slice_mut()
                                             {
-                                                source.add_events(Events::EPOLLOUT);
+                                                (*n, *src) = socket.recv_from(buf).unwrap();
+
+                                                if let Some(mut source) = source
+                                                    .as_mut()
+                                                    .event()
+                                                    .get_event_source_io(socket_in_id)
+                                                {
+                                                    source.as_mut().add_events(Events::EPOLLOUT);
+                                                }
                                             }
-                                        }
-                                    })
-                                    .handle(Events::EPOLLOUT, || {
-                                        source.remove_events(Events::EPOLLOUT);
+                                        })
+                                        .handle(Events::EPOLLOUT, || {
+                                            source.as_mut().remove_events(Events::EPOLLOUT);
 
-                                        let State { clients, .. } =
-                                            source.event().userdata::<State>();
-                                        let buffer = &mut clients[i].buffer_out;
+                                            let State { clients, .. } =
+                                                source.as_mut().event().userdata::<State>();
+                                            let buffer = &mut clients[i].buffer_out;
 
-                                        if let Some((buffer, _src)) = buffer.take_slice() {
-                                            let _ = socket.send_to(buffer, addr_out);
-                                        }
-                                    })
-                                    .end()
-                            },
-                        );
+                                            if let Some((buffer, _src)) = buffer.take_slice() {
+                                                let _ = socket.send_to(buffer, addr_out);
+                                            }
+                                        })
+                                        .end()
+                                },
+                            )
+                            .id();
 
                         Ok(Client {
                             id,
@@ -303,7 +322,8 @@ fn main() -> Result<std::process::ExitCode> {
                 struct Client {
                     source_in: EventSourceId,
                     source_out: EventSourceId,
-                    pipe: Pipe,
+                    pipe_in: Pipe,
+                    pipe_out: Pipe,
                     closed: bool,
                 }
 

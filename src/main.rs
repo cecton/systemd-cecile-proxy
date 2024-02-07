@@ -332,8 +332,9 @@ fn main() -> Result<std::process::ExitCode> {
                     socket_in,
                     Events::EPOLLIN,
                     move |mut source, socket, mut events| {
+                        let mut drop = false;
                         events
-                            .handle(Events::EPOLLIN, move || {
+                            .handle(Events::EPOLLIN, || {
                                 use std::os::fd::AsRawFd;
                                 dbg!(socket.as_raw_fd());
 
@@ -357,12 +358,8 @@ fn main() -> Result<std::process::ExitCode> {
 
                                     dbg!(1);
                                     let id = source.id();
-                                    {
-                                        let mut source =
-                                            source.event().get_event_source_io(id).unwrap();
-                                        dbg!(2);
-                                        source.drop();
-                                    }
+                                    dbg!(2);
+                                    drop = true;
                                     dbg!(3);
                                     source.get_events();
                                     dbg!(4);
@@ -379,7 +376,10 @@ fn main() -> Result<std::process::ExitCode> {
                             .handle(Events::EPOLLHUP, || {
                                 dbg!("client hangs up");
                             })
-                            .end()
+                            .end();
+                        if drop {
+                            source.drop();
+                        }
                     },
                 );
             }

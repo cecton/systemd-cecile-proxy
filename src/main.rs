@@ -304,7 +304,6 @@ fn main() -> Result<std::process::ExitCode> {
             }
             ListenObject::TcpListener(socket_in) => {
                 use pipe::Pipe;
-                use std::io::Read;
 
                 log_info!(
                     " * TCP: {} <-> {}",
@@ -313,13 +312,14 @@ fn main() -> Result<std::process::ExitCode> {
                 );
                 let addr_out: net::SocketAddr = addr_out.parse()?;
                 let connections_max = args.connections_max;
-                let mut buffer = [0; 65507];
 
                 struct Client {
                     source_in: EventSourceId,
                     source_out: EventSourceId,
                     pipe_in: Pipe,
                     pipe_out: Pipe,
+                    in_full: usize,
+                    out_full: usize,
                 }
 
                 #[derive(Default)]
@@ -336,49 +336,110 @@ fn main() -> Result<std::process::ExitCode> {
                                 use std::os::fd::AsRawFd;
                                 dbg!(socket.as_raw_fd());
 
-                                let (mut stream_in, src) = socket.accept().unwrap();
+                                let (stream_in, src) = socket.accept().unwrap();
                                 dbg!(stream_in.as_raw_fd());
 
-                                let n = stream_in.read(&mut buffer).unwrap();
-                                let s = String::from_utf8_lossy(&buffer[..n]);
-                                dbg!(src, s);
-
-                                let stream_out = net::TcpStream::connect(addr_out).unwrap();
+                                let stream_out = {
+                                    let addr_out = socket2::SockAddr::from(addr_out);
+                                    let mut socket = match socket2::Socket::new(
+                                        addr_out.domain(),
+                                        socket2::Type::STREAM,
+                                        None,
+                                    ) {
+                                        Ok(x) => x,
+                                        Err(err) => {
+                                            log_err!("Could not connect to server: {err}");
+                                            return;
+                                        }
+                                    };
+                                    socket.set_nonblocking(true).unwrap();
+                                    let _ = socket.connect(&addr_out);
+                                    socket
+                                };
+                                dbg!(stream_out.as_raw_fd());
 
                                 let State { clients, .. } = source.event().userdata::<State>();
 
-                                if clients.len() < connections_max {
-                                    let (Ok(pipe_in), Ok(pipe_out)) = (Pipe::new(), Pipe::new())
-                                    else {
-                                        log_err!("Could not create new pipes.");
-                                        return;
-                                    };
-
-                                    let source_in = source
-                                        .event()
-                                        .add_io(
-                                            stream_in,
-                                            Events::EPOLLIN,
-                                            move |_source, _socket, _events| {},
-                                        )
-                                        .id();
-
-                                    let source_out = source
-                                        .event()
-                                        .add_io(
-                                            stream_out,
-                                            Events::EPOLLIN,
-                                            move |_source, _socket, _events| {},
-                                        )
-                                        .id();
-
-                                    clients.push(Client {
-                                        source_in,
-                                        source_out,
-                                        pipe_in,
-                                        pipe_out,
-                                    });
+                                if clients.len() >= connections_max {
+                                    log_warning!("Maximum number of connections reached.");
+                                    return;
                                 }
+
+                                let (Ok(pipe_in), Ok(pipe_out)) = (Pipe::new(), Pipe::new()) else {
+                                    log_err!("Could not create new pipes.");
+                                    return;
+                                };
+
+                                let i = clients.len();
+
+                                let source_in = source
+                                    .event()
+                                    .add_io(
+                                        stream_in,
+                                        Events::EPOLLIN,
+                                        move |source, socket, _events| {
+                                            let State { clients, .. } =
+                                                source.event().userdata::<State>();
+                                            let Client {
+                                                source_out,
+                                                ref mut pipe_in,
+                                                ref mut in_full,
+                                                ..
+                                            } = clients[i];
+                                            let mut source_out = source
+                                                .event()
+                                                .get_event_source_io(source_out)
+                                                .unwrap();
+                                            if *in_full < pipe_in.size {
+                                                dbg!(*in_full);
+                                                dbg!(pipe_in.size);
+                                                let fd_out = source_out.raw_fd();
+                                                pipe_in.shovel(socket.as_raw_fd(), fd_out, in_full);
+                                            }
+                                        },
+                                    )
+                                    .id();
+
+                                let source_out = source
+                                    .event()
+                                    .add_io(
+                                        stream_out,
+                                        Events::EPOLLIN,
+                                        move |source, socket, _events| {
+                                            let State { clients, .. } =
+                                                source.event().userdata::<State>();
+                                            let Client {
+                                                source_in,
+                                                ref mut pipe_out,
+                                                ref mut out_full,
+                                                ..
+                                            } = clients[i];
+                                            let mut source_in = source
+                                                .event()
+                                                .get_event_source_io(source_in)
+                                                .unwrap();
+                                            if *out_full < pipe_out.size {
+                                                dbg!(*out_full);
+                                                dbg!(pipe_out.size);
+                                                let fd_in = source_in.raw_fd();
+                                                pipe_out.shovel(
+                                                    socket.as_raw_fd(),
+                                                    fd_in,
+                                                    out_full,
+                                                );
+                                            }
+                                        },
+                                    )
+                                    .id();
+
+                                clients.push(Client {
+                                    source_in,
+                                    source_out,
+                                    pipe_in,
+                                    pipe_out,
+                                    in_full: 0,
+                                    out_full: 0,
+                                });
                             })
                             .end();
                     },
@@ -423,7 +484,7 @@ mod pipe {
     pub struct Pipe {
         fd_r: OwnedFd,
         fd_w: OwnedFd,
-        size: usize,
+        pub size: usize,
     }
 
     impl Pipe {
@@ -498,6 +559,7 @@ mod pipe {
                         break;
                     }
                 }
+                //std::process::exit(1);
             }
         }
     }

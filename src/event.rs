@@ -462,7 +462,6 @@ impl EventSource {
         }
     }
 
-    // TODO remove?
     unsafe fn id(&self) -> EventSourceId {
         EventSourceId::new_unchecked(self.event_source() as _)
     }

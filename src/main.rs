@@ -320,7 +320,6 @@ fn main() -> Result<std::process::ExitCode> {
                     source_out: EventSourceId,
                     pipe_in: Pipe,
                     pipe_out: Pipe,
-                    closed: bool,
                 }
 
                 #[derive(Default)]
@@ -331,8 +330,7 @@ fn main() -> Result<std::process::ExitCode> {
                 pinned.as_mut().add_io(
                     socket_in,
                     Events::EPOLLIN,
-                    move |mut source, socket, mut events| {
-                        let mut drop = false;
+                    move |source, socket, mut events| {
                         events
                             .handle(Events::EPOLLIN, || {
                                 use std::os::fd::AsRawFd;
@@ -345,41 +343,44 @@ fn main() -> Result<std::process::ExitCode> {
                                 let s = String::from_utf8_lossy(&buffer[..n]);
                                 dbg!(src, s);
 
-                                //let stream_out = net::TcpStream::connect(addr_out).unwrap();
+                                let stream_out = net::TcpStream::connect(addr_out).unwrap();
 
                                 let State { clients, .. } = source.event().userdata::<State>();
 
-                                if clients.iter().filter(|x| !x.closed).count() < connections_max {
+                                if clients.len() < connections_max {
                                     let (Ok(pipe_in), Ok(pipe_out)) = (Pipe::new(), Pipe::new())
                                     else {
                                         log_err!("Could not create new pipes.");
                                         return;
                                     };
 
-                                    dbg!(1);
-                                    let id = source.id();
-                                    dbg!(2);
-                                    drop = true;
-                                    dbg!(3);
-                                    source.get_events();
-                                    dbg!(4);
+                                    let source_in = source
+                                        .event()
+                                        .add_io(
+                                            stream_in,
+                                            Events::EPOLLIN,
+                                            move |_source, _socket, _events| {},
+                                        )
+                                        .id();
 
-                                    /*
+                                    let source_out = source
+                                        .event()
+                                        .add_io(
+                                            stream_out,
+                                            Events::EPOLLIN,
+                                            move |_source, _socket, _events| {},
+                                        )
+                                        .id();
+
                                     clients.push(Client {
-                                        closed: false,
+                                        source_in,
+                                        source_out,
                                         pipe_in,
                                         pipe_out,
                                     });
-                                    */
                                 }
                             })
-                            .handle(Events::EPOLLHUP, || {
-                                dbg!("client hangs up");
-                            })
                             .end();
-                        if drop {
-                            source.drop();
-                        }
                     },
                 );
             }

@@ -79,7 +79,7 @@ impl Event {
         })
     }
 
-    unsafe fn remove_event_source(self: Pin<&mut Self>, id: EventSourceId) {
+    unsafe fn unregister_event_source(self: Pin<&mut Self>, id: EventSourceId) {
         self.with_event_sources(|vec| {
             if let Some(i) = vec.iter_mut().position(|x| x.get_mut().id() == id) {
                 vec.remove(i);
@@ -758,9 +758,9 @@ impl EventSourceHandle<'_, EventSourceIo> {
         }
     }
 
-    pub fn drop(self) {
+    pub fn unregister(self) {
         unsafe {
-            self.event().remove_event_source(self.id());
+            self.event().unregister_event_source(self.id());
         }
     }
 }

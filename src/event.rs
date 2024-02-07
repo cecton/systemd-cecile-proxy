@@ -1,5 +1,6 @@
 use libsystemd_sys::event as ffi;
 use std::any::*;
+use std::cell::*;
 use std::collections::HashMap;
 use std::ffi::*;
 use std::mem;
@@ -10,7 +11,7 @@ use std::ptr;
 
 pub struct Event {
     event: *mut ffi::sd_event,
-    event_sources: Vec<EventSource>,
+    event_sources: Vec<RefCell<EventSource>>,
     userdata: HashMap<TypeId, Box<dyn Any>>,
     _pin: std::marker::PhantomPinned,
 }
@@ -63,7 +64,7 @@ impl Event {
 
     unsafe fn with_event_sources<'a, T>(
         self: Pin<&'a mut Self>,
-        callback: impl FnOnce(&'a mut Vec<EventSource>) -> T,
+        callback: impl FnOnce(&'a mut Vec<RefCell<EventSource>>) -> T,
     ) -> T {
         callback(&mut self.get_unchecked_mut().event_sources)
     }
@@ -73,14 +74,14 @@ impl Event {
         event_source: impl Into<EventSource>,
     ) -> &mut EventSource {
         self.with_event_sources(|vec| {
-            vec.push(event_source.into());
-            vec.last_mut().unwrap()
+            vec.push(RefCell::new(event_source.into()));
+            vec.last_mut().unwrap().get_mut()
         })
     }
 
     unsafe fn remove_event_source(self: Pin<&mut Self>, id: EventSourceId) {
         self.with_event_sources(|vec| {
-            if let Some(i) = vec.iter().position(|x| x.id() == id) {
+            if let Some(i) = vec.iter_mut().position(|x| x.get_mut().id() == id) {
                 vec.remove(i);
             }
         })
@@ -113,21 +114,18 @@ impl Event {
         clock: Clock,
         usec: Usec,
         accuracy: u64,
-        callback: impl FnMut(EventSourceHandle<&mut EventSourceTime>, u64) -> Usec + 'static,
-    ) -> EventSourceHandle<&mut EventSourceTime> {
+        callback: impl FnMut(EventSourceHandle<EventSourceTime>, u64) -> Usec + 'static,
+    ) -> EventSourceHandle<EventSourceTime> {
         unsafe {
             let event = self.event;
-            let mut source = {
+            let source = {
                 let event = self.as_mut().as_mut_ptr();
-                self.add_event_source(EventSourceTime {
+                self.as_mut().add_event_source(EventSourceTime {
                     event_source: ptr::null_mut(),
                     event,
                     handler: Box::new(callback),
-                    borrowed: false,
                     _pin: Default::default(),
                 })
-                .as_time()
-                .unwrap()
             };
 
             unsafe extern "C" fn handler(
@@ -141,17 +139,20 @@ impl Event {
                 let EventSourceTime {
                     handler,
                     event_source,
+                    event,
                     ..
                 } = ptr.as_mut();
-                let next_usec =
-                    (handler)(EventSourceHandle(Pin::new_unchecked(ptr.as_mut())), usec);
-                match next_usec {
-                    Usec::Absolute(x) => {
-                        ffi::sd_event_source_set_time(*event_source, x);
-                    }
-                    #[cfg(feature = "systemd_v247")]
-                    Usec::Relative(x) => {
-                        ffi::sd_event_source_set_time_relative(*event_source, x);
+                let event = Event::from_mut_ptr(*event);
+                if let Some(handle) = event.get_event_source_time(ptr.as_mut().id()) {
+                    let next_usec = (handler)(handle, usec);
+                    match next_usec {
+                        Usec::Absolute(x) => {
+                            ffi::sd_event_source_set_time(*event_source, x);
+                        }
+                        #[cfg(feature = "systemd_v247")]
+                        Usec::Relative(x) => {
+                            ffi::sd_event_source_set_time_relative(*event_source, x);
+                        }
                     }
                 }
                 0
@@ -185,7 +186,8 @@ impl Event {
 
             assert!(!source.event_source().is_null());
 
-            source
+            let id = source.id();
+            self.get_event_source_time(id).unwrap()
         }
     }
 
@@ -193,24 +195,24 @@ impl Event {
         mut self: Pin<&mut Self>,
         mut io: IO,
         events: Events,
-        mut callback: impl FnMut(EventSourceHandle<&mut EventSourceIo>, &mut IO, Events) + 'static,
-    ) -> EventSourceHandle<&mut EventSourceIo> {
+        mut callback: impl FnMut(EventSourceHandle<EventSourceIo>, &mut IO, Events) + 'static,
+    ) -> EventSourceHandle<EventSourceIo> {
         unsafe {
             let event = self.event;
             let fd = io.as_raw_fd();
-            let mut source = {
+            let source = {
                 let event = self.as_mut().as_mut_ptr();
-                self.add_event_source(EventSourceIo {
-                    event_source: ptr::null_mut(),
-                    event,
-                    handler: Box::new(move |event_source, events| {
-                        callback(event_source, &mut io, events)
-                    }),
-                    borrowed: false,
-                    _pin: Default::default(),
-                })
-                .as_io()
-                .unwrap()
+                self.as_mut()
+                    .add_event_source(EventSourceIo {
+                        event_source: ptr::null_mut(),
+                        event,
+                        handler: Box::new(move |event_source, events| {
+                            callback(event_source, &mut io, events)
+                        }),
+                        _pin: Default::default(),
+                    })
+                    .as_io()
+                    .unwrap()
             };
 
             unsafe extern "C" fn handler(
@@ -222,10 +224,11 @@ impl Event {
                 let Some(mut ptr) = ptr::NonNull::<EventSourceIo>::new(userdata as *mut _) else {
                     return 0;
                 };
-                (ptr.as_mut().handler)(
-                    EventSourceHandle(Pin::new_unchecked(ptr.as_mut())),
-                    Events(revents),
-                );
+                let EventSourceIo { event, handler, .. } = ptr.as_mut();
+                let event = Event::from_mut_ptr(*event);
+                if let Some(handle) = event.get_event_source_io(ptr.as_mut().id()) {
+                    (handler)(handle, Events(revents));
+                }
                 0
             }
 
@@ -237,7 +240,7 @@ impl Event {
             assert!(
                 ffi::sd_event_add_io(
                     event,
-                    &mut source.event_source(),
+                    &mut source.event_source,
                     fd,
                     events.0,
                     Some(handler),
@@ -246,30 +249,31 @@ impl Event {
                 "Could not add io event handler to the event loop."
             );
 
-            assert!(!source.event_source().is_null());
+            assert!(!source.event_source.is_null());
 
-            source
+            let id = source.id();
+            self.get_event_source_io(id).unwrap()
         }
     }
 
     pub fn add_signal(
         mut self: Pin<&mut Self>,
         signal: Signal,
-        callback: impl FnMut(EventSourceHandle<&mut EventSourceSignal>, &SignalInfo) + 'static,
-    ) -> EventSourceHandle<&mut EventSourceSignal> {
+        callback: impl FnMut(EventSourceHandle<EventSourceSignal>, &SignalInfo) + 'static,
+    ) -> EventSourceHandle<EventSourceSignal> {
         unsafe {
             let event = self.event;
-            let mut source = {
+            let source = {
                 let event = self.as_mut().as_mut_ptr();
-                self.add_event_source(EventSourceSignal {
-                    event_source: ptr::null_mut(),
-                    event,
-                    handler: Some(Box::new(callback)),
-                    borrowed: false,
-                    _pin: Default::default(),
-                })
-                .as_signal()
-                .unwrap()
+                self.as_mut()
+                    .add_event_source(EventSourceSignal {
+                        event_source: ptr::null_mut(),
+                        event,
+                        handler: Some(Box::new(callback)),
+                        _pin: Default::default(),
+                    })
+                    .as_signal()
+                    .unwrap()
             };
 
             unsafe extern "C" fn handler(
@@ -281,11 +285,12 @@ impl Event {
                 else {
                     return 0;
                 };
-                if let Some(handler) = ptr.as_mut().handler.as_mut() {
-                    (handler)(
-                        EventSourceHandle(Pin::new_unchecked(ptr.as_mut())),
-                        &*sig_info,
-                    );
+                let EventSourceSignal { handler, event, .. } = ptr.as_mut();
+                let event = Event::from_mut_ptr(*event);
+                if let Some(handler) = handler {
+                    if let Some(handle) = event.get_event_source_signal(ptr.as_mut().id()) {
+                        (handler)(handle, &*sig_info);
+                    }
                 }
                 0
             }
@@ -295,7 +300,7 @@ impl Event {
             assert!(
                 ffi::sd_event_add_signal(
                     event,
-                    &mut source.event_source(),
+                    &mut source.event_source,
                     signal.0,
                     Some(handler),
                     source.as_mut_ptr() as _,
@@ -303,29 +308,30 @@ impl Event {
                 "Could not add signal event handler to the event loop."
             );
 
-            assert!(!source.event_source().is_null());
+            assert!(!source.event_source.is_null());
 
-            source
+            let id = source.id();
+            self.get_event_source_signal(id).unwrap()
         }
     }
 
     pub fn add_signal_default(
         mut self: Pin<&mut Self>,
         signal: Signal,
-    ) -> EventSourceHandle<&mut EventSourceSignal> {
+    ) -> EventSourceHandle<EventSourceSignal> {
         unsafe {
             let event = self.event;
-            let mut source = {
+            let source = {
                 let event = self.as_mut().as_mut_ptr();
-                self.add_event_source(EventSourceSignal {
-                    event_source: ptr::null_mut(),
-                    event,
-                    handler: None,
-                    borrowed: false,
-                    _pin: Default::default(),
-                })
-                .as_signal()
-                .unwrap()
+                self.as_mut()
+                    .add_event_source(EventSourceSignal {
+                        event_source: ptr::null_mut(),
+                        event,
+                        handler: None,
+                        _pin: Default::default(),
+                    })
+                    .as_signal()
+                    .unwrap()
             };
 
             block_signal(signal);
@@ -333,7 +339,7 @@ impl Event {
             assert!(
                 ffi::sd_event_add_signal(
                     event,
-                    &mut source.event_source(),
+                    &mut source.event_source,
                     signal.0,
                     None,
                     source.as_mut_ptr() as _,
@@ -341,9 +347,10 @@ impl Event {
                 "Could not add signal event handler to the event loop."
             );
 
-            assert!(!source.event_source().is_null());
+            assert!(!source.event_source.is_null());
 
-            source
+            let id = source.id();
+            self.get_event_source_signal(id).unwrap()
         }
     }
 
@@ -361,39 +368,45 @@ impl Event {
     pub fn get_event_source_time(
         self: Pin<&mut Self>,
         id: EventSourceId,
-    ) -> Option<EventSourceHandle<&mut EventSourceTime>> {
+    ) -> Option<EventSourceHandle<EventSourceTime>> {
         unsafe {
             self.get_unchecked_mut()
                 .event_sources
                 .iter_mut()
-                .flat_map(|x| x.as_time())
-                .find(|x| x.id() == id)
+                .flat_map(|x| x.try_borrow_mut())
+                .find(|x| x.id() == id && x.is_time())
+                .map(|x| RefMut::map(x, |x| x.as_time().unwrap()))
+                .map(|x| EventSourceHandle(Pin::new_unchecked(x)))
         }
     }
 
     pub fn get_event_source_io(
         self: Pin<&mut Self>,
         id: EventSourceId,
-    ) -> Option<EventSourceHandle<&mut EventSourceIo>> {
+    ) -> Option<EventSourceHandle<EventSourceIo>> {
         unsafe {
             self.get_unchecked_mut()
                 .event_sources
                 .iter_mut()
-                .flat_map(|x| x.as_io())
-                .find(|x| x.id() == id)
+                .flat_map(|x| x.try_borrow_mut())
+                .find(|x| x.id() == id && x.is_io())
+                .map(|x| RefMut::map(x, |x| x.as_io().unwrap()))
+                .map(|x| EventSourceHandle(Pin::new_unchecked(x)))
         }
     }
 
     pub fn get_event_source_signal(
         self: Pin<&mut Self>,
         id: EventSourceId,
-    ) -> Option<EventSourceHandle<&mut EventSourceSignal>> {
+    ) -> Option<EventSourceHandle<EventSourceSignal>> {
         unsafe {
             self.get_unchecked_mut()
                 .event_sources
                 .iter_mut()
-                .flat_map(|x| x.as_signal())
-                .find(|x| x.id() == id)
+                .flat_map(|x| x.try_borrow_mut())
+                .find(|x| x.id() == id && x.is_signal())
+                .map(|x| RefMut::map(x, |x| x.as_signal().unwrap()))
+                .map(|x| EventSourceHandle(Pin::new_unchecked(x)))
         }
     }
 }
@@ -446,31 +459,60 @@ impl EventSource {
         EventSourceId::new_unchecked(self.event_source() as _)
     }
 
-    unsafe fn as_time(&mut self) -> Option<EventSourceHandle<&mut EventSourceTime>> {
-            match self {
-                EventSource::Time(x) => x.try_borrow(),
-                _ => None,
-            }
+    unsafe fn as_mut_ptr(&mut self) -> *mut libc::c_void {
+        match self {
+            EventSource::Time(x) => x.as_mut_ptr() as _,
+            EventSource::Io(x) => x.as_mut_ptr() as _,
+            EventSource::Signal(x) => x.as_mut_ptr() as _,
+        }
     }
 
-    unsafe fn as_io(&mut self) -> Option<EventSourceHandle<&mut EventSourceIo>> {
-            match self {
-                EventSource::Io(x) => x.try_borrow(),
-                _ => None,
-            }
+    unsafe fn is_time(&self) -> bool {
+        match self {
+            EventSource::Time(_) => true,
+            _ => false,
+        }
     }
 
-    unsafe fn as_signal(&mut self) -> Option<EventSourceHandle<&mut EventSourceSignal>> {
-            match self {
-                EventSource::Signal(x) => x.try_borrow(),
-                _ => None,
-            }
+    unsafe fn as_time(&mut self) -> Option<&mut EventSourceTime> {
+        match self {
+            EventSource::Time(x) => Some(x),
+            _ => None,
+        }
+    }
+
+    unsafe fn is_io(&self) -> bool {
+        match self {
+            EventSource::Io(_) => true,
+            _ => false,
+        }
+    }
+
+    unsafe fn as_io(&mut self) -> Option<&mut EventSourceIo> {
+        match self {
+            EventSource::Io(x) => Some(x),
+            _ => None,
+        }
+    }
+
+    unsafe fn is_signal(&self) -> bool {
+        match self {
+            EventSource::Signal(_) => true,
+            _ => false,
+        }
+    }
+
+    unsafe fn as_signal(&mut self) -> Option<&mut EventSourceSignal> {
+        match self {
+            EventSource::Signal(x) => Some(x),
+            _ => None,
+        }
     }
 }
 
-pub struct EventSourceHandle<T>(Pin<T>);
+pub struct EventSourceHandle<'a, T>(Pin<RefMut<'a, T>>);
 
-impl<T> EventSourceHandle<&mut T> {
+impl<T> EventSourceHandle<'_, T> {
     #[inline]
     fn as_mut(&mut self) -> Pin<&mut T> {
         self.0.as_mut()
@@ -487,37 +529,22 @@ impl<T> EventSourceHandle<&mut T> {
     }
 }
 
-impl<T> Drop for EventSourceHandle<T> {
-    fn drop(&mut self) {
-    }
-}
-
 pub type EventSourceId = num::NonZeroU64;
 
 macro_rules! impl_event_source_base_methods {
     ($ty:ty) => {
-        impl EventSourceHandle<&mut $ty> {
-            #[inline]
-            unsafe fn as_mut_ptr(&mut self) -> *mut $ty {
-                self.get_unchecked_mut() as *mut _
-            }
-
-            #[inline]
-            fn event_source(&mut self) -> *mut ffi::sd_event_source {
-                self.as_mut().event_source
-            }
-
+        impl EventSourceHandle<'_, $ty> {
             #[inline]
             pub fn enable(&mut self) {
                 unsafe {
-                    ffi::sd_event_source_set_enabled(self.as_mut().event_source, ffi::SD_EVENT_ON);
+                    ffi::sd_event_source_set_enabled(self.as_ref().event_source, ffi::SD_EVENT_ON);
                 }
             }
 
             #[inline]
             pub fn disable(&mut self) {
                 unsafe {
-                    ffi::sd_event_source_set_enabled(self.as_mut().event_source, ffi::SD_EVENT_OFF);
+                    ffi::sd_event_source_set_enabled(self.as_ref().event_source, ffi::SD_EVENT_OFF);
                 }
             }
 
@@ -525,7 +552,7 @@ macro_rules! impl_event_source_base_methods {
             pub fn oneshot(&mut self) {
                 unsafe {
                     ffi::sd_event_source_set_enabled(
-                        self.as_mut().event_source,
+                        self.as_ref().event_source,
                         ffi::SD_EVENT_ONESHOT,
                     );
                 }
@@ -544,18 +571,13 @@ macro_rules! impl_event_source_base_methods {
 
         impl $ty {
             #[inline]
-            unsafe fn try_borrow(&mut self) -> Option<EventSourceHandle<&mut $ty>> {
-                if self.borrowed {
-                    None
-                } else {
-                    self.borrowed = true;
-                    Some(EventSourceHandle(Pin::new_unchecked(self)))
-                }
+            fn id(&self) -> EventSourceId {
+                unsafe { EventSourceId::new_unchecked(self.event_source as _) }
             }
 
             #[inline]
-            fn free_borrow(&mut self) {
-                self.borrowed = false;
+            unsafe fn as_mut_ptr(&mut self) -> *mut $ty {
+                self as *mut _
             }
         }
     };
@@ -564,8 +586,7 @@ macro_rules! impl_event_source_base_methods {
 pub struct EventSourceTime {
     event_source: *mut ffi::sd_event_source,
     event: *mut Event,
-    handler: Box<dyn FnMut(EventSourceHandle<&mut EventSourceTime>, u64) -> Usec>,
-    borrowed: bool,
+    handler: Box<dyn FnMut(EventSourceHandle<EventSourceTime>, u64) -> Usec>,
     _pin: std::marker::PhantomPinned,
 }
 
@@ -577,16 +598,16 @@ impl From<EventSourceTime> for EventSource {
 
 impl_event_source_base_methods!(EventSourceTime);
 
-impl EventSourceHandle<&mut EventSourceTime> {
+impl EventSourceHandle<'_, EventSourceTime> {
     pub fn set_time(&mut self, usec: Usec) {
         unsafe {
             match usec {
                 Usec::Absolute(x) => {
-                    ffi::sd_event_source_set_time(self.event_source(), x);
+                    ffi::sd_event_source_set_time(self.as_ref().event_source, x);
                 }
                 #[cfg(feature = "systemd_v247")]
                 Usec::Relative(x) => {
-                    ffi::sd_event_source_set_time_relative(self.event_source(), x);
+                    ffi::sd_event_source_set_time_relative(self.as_ref().event_source, x);
                 }
             }
         }
@@ -664,8 +685,7 @@ impl Events {
 pub struct EventSourceIo {
     event_source: *mut ffi::sd_event_source,
     event: *mut Event,
-    handler: Box<dyn FnMut(EventSourceHandle<&mut EventSourceIo>, Events)>,
-    borrowed: bool,
+    handler: Box<dyn FnMut(EventSourceHandle<EventSourceIo>, Events)>,
     _pin: std::marker::PhantomPinned,
 }
 
@@ -677,12 +697,12 @@ impl From<EventSourceIo> for EventSource {
 
 impl_event_source_base_methods!(EventSourceIo);
 
-impl EventSourceHandle<&mut EventSourceIo> {
+impl EventSourceHandle<'_, EventSourceIo> {
     pub fn get_events(&mut self) -> Events {
         unsafe {
             let mut events = Events(0);
             assert!(
-                ffi::sd_event_source_get_io_events(self.event_source(), &mut events.0) >= 0,
+                ffi::sd_event_source_get_io_events(self.as_ref().event_source, &mut events.0) >= 0,
                 "Could not set events on IO event handler."
             );
             events
@@ -692,7 +712,7 @@ impl EventSourceHandle<&mut EventSourceIo> {
     pub fn set_events(&mut self, events: Events) {
         unsafe {
             assert!(
-                ffi::sd_event_source_set_io_events(self.event_source(), events.0) >= 0,
+                ffi::sd_event_source_set_io_events(self.as_ref().event_source, events.0) >= 0,
                 "Could not set events on IO event handler."
             );
         }
@@ -709,26 +729,24 @@ impl EventSourceHandle<&mut EventSourceIo> {
     }
 
     pub fn raw_fd(&mut self) -> BorrowedFd {
-        unsafe { BorrowedFd::borrow_raw(ffi::sd_event_source_get_io_fd(self.event_source())) }
+        unsafe {
+            BorrowedFd::borrow_raw(ffi::sd_event_source_get_io_fd(self.as_ref().event_source))
+        }
     }
 
     pub fn replace<IO: AsRawFd + 'static>(
         &mut self,
         mut io: IO,
-        mut callback: impl FnMut(EventSourceHandle<&mut EventSourceIo>, &mut IO, Events) + 'static,
+        mut callback: impl FnMut(EventSourceHandle<EventSourceIo>, &mut IO, Events) + 'static,
     ) {
         unsafe {
-            let id = self.id();
-            let event = self.event();
-            let fd = io.as_raw_fd();
-
-            self.0.as_mut().get_unchecked_mut().handler =
-                Box::new(move |event_source, events| callback(event_source, &mut io, events));
-
             assert!(
-                ffi::sd_event_source_set_io_fd(self.event_source(), fd) >= 0,
+                ffi::sd_event_source_set_io_fd(self.as_ref().event_source, io.as_raw_fd()) >= 0,
                 "Failed to set the event handler's file descriptor."
             );
+
+            self.get_unchecked_mut().handler =
+                Box::new(move |event_source, events| callback(event_source, &mut io, events));
         }
     }
 
@@ -742,8 +760,7 @@ impl EventSourceHandle<&mut EventSourceIo> {
 pub struct EventSourceSignal {
     event_source: *mut ffi::sd_event_source,
     event: *mut Event,
-    handler: Option<Box<dyn FnMut(EventSourceHandle<&mut EventSourceSignal>, &SignalInfo)>>,
-    borrowed: bool,
+    handler: Option<Box<dyn FnMut(EventSourceHandle<EventSourceSignal>, &SignalInfo)>>,
     _pin: std::marker::PhantomPinned,
 }
 

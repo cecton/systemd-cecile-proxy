@@ -1,3 +1,5 @@
+//#![allow(unused_variables, unused_mut, dead_code)]
+
 pub mod daemon;
 pub mod event;
 pub mod journal;
@@ -342,7 +344,7 @@ fn main() -> Result<std::process::ExitCode> {
                                 let s = String::from_utf8_lossy(&buffer[..n]);
                                 dbg!(src, s);
 
-                                let stream_out = net::TcpStream::connect(addr_out).unwrap();
+                                //let stream_out = net::TcpStream::connect(addr_out).unwrap();
 
                                 let State { clients, .. } = source.event().userdata::<State>();
 
@@ -353,13 +355,17 @@ fn main() -> Result<std::process::ExitCode> {
                                         return;
                                     };
 
+                                    dbg!(1);
                                     let id = source.id();
                                     {
-                                    let mut source =
-                                        source.event().get_event_source_io(id).unwrap();
-                                    source.drop();
+                                        let mut source =
+                                            source.event().get_event_source_io(id).unwrap();
+                                        dbg!(2);
+                                        source.drop();
                                     }
+                                    dbg!(3);
                                     source.get_events();
+                                    dbg!(4);
 
                                     /*
                                     clients.push(Client {

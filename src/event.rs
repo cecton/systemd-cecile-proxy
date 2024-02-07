@@ -137,21 +137,21 @@ impl Event {
                     return 0;
                 };
                 let EventSourceTime {
-                    handler,
+                    ref mut handler,
                     event_source,
                     event,
                     ..
-                } = ptr.as_mut();
-                let event = Event::from_mut_ptr(*event);
+                } = *ptr.as_mut();
+                let event = Event::from_mut_ptr(event);
                 if let Some(handle) = event.get_event_source_time(ptr.as_mut().id()) {
                     let next_usec = (handler)(handle, usec);
                     match next_usec {
                         Usec::Absolute(x) => {
-                            ffi::sd_event_source_set_time(*event_source, x);
+                            ffi::sd_event_source_set_time(event_source, x);
                         }
                         #[cfg(feature = "systemd_v247")]
                         Usec::Relative(x) => {
-                            ffi::sd_event_source_set_time_relative(*event_source, x);
+                            ffi::sd_event_source_set_time_relative(event_source, x);
                         }
                     }
                 }
@@ -224,8 +224,12 @@ impl Event {
                 let Some(mut ptr) = ptr::NonNull::<EventSourceIo>::new(userdata as *mut _) else {
                     return 0;
                 };
-                let EventSourceIo { event, handler, .. } = ptr.as_mut();
-                let event = Event::from_mut_ptr(*event);
+                let EventSourceIo {
+                    event,
+                    ref mut handler,
+                    ..
+                } = *ptr.as_mut();
+                let event = Event::from_mut_ptr(event);
                 if let Some(handle) = event.get_event_source_io(ptr.as_mut().id()) {
                     (handler)(handle, Events(revents));
                 }
@@ -285,8 +289,12 @@ impl Event {
                 else {
                     return 0;
                 };
-                let EventSourceSignal { handler, event, .. } = ptr.as_mut();
-                let event = Event::from_mut_ptr(*event);
+                let EventSourceSignal {
+                    ref mut handler,
+                    event,
+                    ..
+                } = *ptr.as_mut();
+                let event = Event::from_mut_ptr(event);
                 if let Some(handler) = handler {
                     if let Some(handle) = event.get_event_source_signal(ptr.as_mut().id()) {
                         (handler)(handle, &*sig_info);

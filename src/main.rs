@@ -36,8 +36,8 @@ fn main() -> Result<std::process::ExitCode> {
     impl ActivityMonitor {
         fn ping(&mut self, event: Pin<&mut Event>) {
             if let Some(mut source) = event.get_event_source_time(self.id) {
-                let now = source.as_mut().event().now(Clock::Monotonic);
-                source.as_mut().set_time(Usec::Absolute(now + self.usec));
+                let now = source.event().now(Clock::Monotonic);
+                source.set_time(Usec::Absolute(now + self.usec));
             }
         }
     }
@@ -55,7 +55,7 @@ fn main() -> Result<std::process::ExitCode> {
                 Usec::Absolute(0)
             },
         );
-        source.as_mut().enable();
+        source.enable();
         ActivityMonitor {
             id: source.id(),
             usec,
@@ -186,23 +186,21 @@ fn main() -> Result<std::process::ExitCode> {
                         socket_in,
                         Events::EPOLLIN,
                         move |mut source, socket, mut events| {
-                            if let Some(activity_monitor) = source
-                                .as_mut()
-                                .event()
-                                .userdata::<Option<ActivityMonitor>>()
+                            if let Some(activity_monitor) =
+                                source.event().userdata::<Option<ActivityMonitor>>()
                             {
-                                activity_monitor.ping(source.as_mut().event());
+                                activity_monitor.ping(source.event());
                             }
 
                             events
                                 .handle(Events::EPOLLIN, || {
                                     let State {
                                         clients, buffer_in, ..
-                                    } = source.as_mut().event().userdata::<State>();
+                                    } = source.event().userdata::<State>();
 
                                     if let Some((buffer, n, src)) = buffer_in.get_slice_mut() {
                                         (*n, *src) = socket.recv_from(buffer).unwrap();
-                                        let now = source.as_mut().event().now(Clock::Monotonic);
+                                        let now = source.event().now(Clock::Monotonic);
                                         let timeout_threshold = now - network_timeout;
                                         if let Some(i) =
                                             find_client(clients, *src, timeout_threshold)
@@ -216,26 +214,23 @@ fn main() -> Result<std::process::ExitCode> {
                                             client.addr.replace(*src);
                                             client.last_activity = now;
                                             mem::swap(&mut client.buffer_out, buffer_in);
-                                            if let Some(mut source) = source
-                                                .as_mut()
-                                                .event()
-                                                .get_event_source_io(client.id)
+                                            if let Some(mut source) =
+                                                source.event().get_event_source_io(client.id)
                                             {
-                                                source.as_mut().add_events(Events::EPOLLOUT);
+                                                source.add_events(Events::EPOLLOUT);
                                             }
                                         } else {
                                             log_warning!("Maximum number of connections reached.");
                                         }
                                         buffer_in.reset();
                                     } else {
-                                        source.as_mut().remove_events(Events::EPOLLIN);
+                                        source.remove_events(Events::EPOLLIN);
                                     }
                                 })
                                 .handle(Events::EPOLLOUT, || {
-                                    source.as_mut().remove_events(Events::EPOLLOUT);
+                                    source.remove_events(Events::EPOLLOUT);
 
-                                    let State { clients, .. } =
-                                        source.as_mut().event().userdata::<State>();
+                                    let State { clients, .. } = source.event().userdata::<State>();
 
                                     for client in clients {
                                         if let Some(addr) = client.addr {
@@ -265,27 +260,25 @@ fn main() -> Result<std::process::ExitCode> {
                                     events
                                         .handle(Events::EPOLLIN, || {
                                             let State { clients, .. } =
-                                                source.as_mut().event().userdata::<State>();
+                                                source.event().userdata::<State>();
 
                                             if let Some((buf, n, src)) =
                                                 clients[i].buffer_in.get_slice_mut()
                                             {
                                                 (*n, *src) = socket.recv_from(buf).unwrap();
 
-                                                if let Some(mut source) = source
-                                                    .as_mut()
-                                                    .event()
-                                                    .get_event_source_io(socket_in_id)
+                                                if let Some(mut source) =
+                                                    source.event().get_event_source_io(socket_in_id)
                                                 {
-                                                    source.as_mut().add_events(Events::EPOLLOUT);
+                                                    source.add_events(Events::EPOLLOUT);
                                                 }
                                             }
                                         })
                                         .handle(Events::EPOLLOUT, || {
-                                            source.as_mut().remove_events(Events::EPOLLOUT);
+                                            source.remove_events(Events::EPOLLOUT);
 
                                             let State { clients, .. } =
-                                                source.as_mut().event().userdata::<State>();
+                                                source.event().userdata::<State>();
                                             let buffer = &mut clients[i].buffer_out;
 
                                             if let Some((buffer, _src)) = buffer.take_slice() {
@@ -317,6 +310,7 @@ fn main() -> Result<std::process::ExitCode> {
                     addr_out
                 );
                 let addr_out: net::SocketAddr = addr_out.parse()?;
+                let connections_max = args.connections_max;
                 let mut buffer = [0; 65507];
 
                 struct Client {
@@ -327,56 +321,54 @@ fn main() -> Result<std::process::ExitCode> {
                     closed: bool,
                 }
 
+                #[derive(Default)]
                 struct State {
                     clients: Vec<Client>,
-                }
-
-                fn new_client(
-                    clients: &mut Vec<Client>,
-                    connections_max: usize,
-                    new_client: impl FnOnce() -> Client,
-                ) -> Option<&mut Client> {
-                    let mut slot = None;
-
-                    for (i, client) in clients.iter().enumerate() {
-                        if client.closed {
-                            slot = Some(i);
-                            break;
-                        }
-                    }
-
-                    if slot.is_none() && clients.len() < connections_max {
-                        let pipe = match Pipe::new() {
-                            Ok(pipe) => pipe,
-                            Err(err) => {
-                                log_err!("Could not create new pipe: {err}");
-                                return None;
-                            }
-                        };
-                        clients.push((new_client)());
-                        slot.replace(clients.len() - 1);
-                    }
-
-                    slot.map(|i| &mut clients[i])
                 }
 
                 pinned.as_mut().add_io(
                     socket_in,
                     Events::EPOLLIN,
-                    move |_source, socket, mut events| {
+                    move |mut source, socket, mut events| {
                         events
-                            .handle(Events::EPOLLIN, || {
+                            .handle(Events::EPOLLIN, move || {
                                 use std::os::fd::AsRawFd;
                                 dbg!(socket.as_raw_fd());
 
-                                let (mut stream, src) = socket.accept().unwrap();
-                                dbg!(stream.as_raw_fd());
+                                let (mut stream_in, src) = socket.accept().unwrap();
+                                dbg!(stream_in.as_raw_fd());
 
-                                let n = stream.read(&mut buffer).unwrap();
+                                let n = stream_in.read(&mut buffer).unwrap();
                                 let s = String::from_utf8_lossy(&buffer[..n]);
                                 dbg!(src, s);
 
-                                let socket_out = net::TcpStream::connect(addr_out).unwrap();
+                                let stream_out = net::TcpStream::connect(addr_out).unwrap();
+
+                                let State { clients, .. } = source.event().userdata::<State>();
+
+                                if clients.iter().filter(|x| !x.closed).count() < connections_max {
+                                    let (Ok(pipe_in), Ok(pipe_out)) = (Pipe::new(), Pipe::new())
+                                    else {
+                                        log_err!("Could not create new pipes.");
+                                        return;
+                                    };
+
+                                    let id = source.id();
+                                    {
+                                    let mut source =
+                                        source.event().get_event_source_io(id).unwrap();
+                                    source.drop();
+                                    }
+                                    source.get_events();
+
+                                    /*
+                                    clients.push(Client {
+                                        closed: false,
+                                        pipe_in,
+                                        pipe_out,
+                                    });
+                                    */
+                                }
                             })
                             .handle(Events::EPOLLHUP, || {
                                 dbg!("client hangs up");
@@ -390,7 +382,7 @@ fn main() -> Result<std::process::ExitCode> {
 
     notify_ready();
 
-    let res = pinned.as_mut().run();
+    let res = pinned.run();
 
     log_debug!("Event log exited gracefully.");
 
